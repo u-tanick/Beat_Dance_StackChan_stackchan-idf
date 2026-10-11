@@ -1,0 +1,34 @@
+dependencies:
+  espressif/esp_audio_codec: "^2.5.0"
+  # esp-dsp: FFT for the mic lip-sync band-energy estimator
+  # (main/mic_lip_sync_task.cpp). 256-point radix-2 float FFT at 16 kHz
+  # runs in ~150 µs on the ESP32-S3 HiFi SIMD path so fits the 16 ms
+  # chunk budget.
+  espressif/esp-dsp: "^1.5.0"
+  # GC0308 DVP camera + QR decoder for the connpass-QR feature. Both are
+  # gated on the CONFIG_STACKCHAN_CAMERA_ENABLED Kconfig knob (see
+  # components/board/Kconfig) so the atoms3r profile, which has no GC0308,
+  # never compiles or links them — that's what the `rules:` block below is
+  # for in the IDF component manager manifest.
+  espressif/esp32-camera: "^2.0.15"
+  espressif/quirc: "^1.2.0"
+  # [ASR Phase 0] esp-sr: on-device wake word (WakeNet) + AFE. Fetched
+  # always but only used when CONFIG_STACKCHAN_ASR_ENABLED (models selected
+  # via menuconfig → flashed to the `model` partition). cores3-asr variant.
+  #
+  # Pinned to 2.4.x: esp-sr 2.5.x pulls in esp-dl (~1 MB of extra .text)
+  # which pushed the cores3 image past its 4 MB OTA slot in CI (v0.12.0
+  # first attempt: 0x45b4e0 vs 0x371bb0 on 2.4.7). dependencies.lock is
+  # gitignored, so CI always resolves fresh — the manifest must carry the cap.
+  espressif/esp-sr: "~2.4.0"
+  # M5GFX: ONE copy only. M5Unified's manifest requires m5stack/m5gfx, so the
+  # component manager would download a registry copy; override_path points it
+  # at our submodule (third_party/m5gfx, deliberately outside components/ so
+  # it is not auto-discovered as a second component). Before 2026-09-18 both
+  # copies were built: headers came from the submodule, code from the managed
+  # library, and when m5gfx 0.2.27 changed pin_backup_t's layout the ABI
+  # mismatch broke i2c_temporary_switcher_t and killed the AtomNyan nekomimi
+  # LEDs (docs/known_issues.md §5). Bump M5GFX by moving the submodule.
+  m5stack/m5gfx:
+    version: "*"
+    override_path: "../third_party/m5gfx"

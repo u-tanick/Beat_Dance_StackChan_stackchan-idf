@@ -1,0 +1,50 @@
+PLAN.md
+
+build/
+build-*/
+
+sdkconfig
+sdkconfig.old
+sdkconfig.defaults.local
+sdkconfig.defaults.*.local
+
+managed_components/
+# dependencies.lock is COMMITTED (2026-09-18): CI and local must resolve the
+# same managed-component versions. Regenerate deliberately when bumping.
+
+# Pinned PROJECT_VER override written by CI's release workflow (overrides
+# git_describe for esp_app_desc.version). Local builds rely on git_describe
+# directly.
+version.txt
+
+Makefile.local
+
+# Debug captures at repo root: Saleae I2C exports (see docs/known_issues.md §2)
+# and tools/monitor_log.py serial dumps. Kept local, never committed.
+/i2c*.csv
+/output.log
+
+*.swp
+*.swo
+.DS_Store
+.vscode/
+.idea/
+
+# Channel adapter (tools/stackchan-channel) — Bun installs deps locally; the
+# lockfile is tracked for reproducible installs but the resolved tree isn't.
+node_modules/
+
+# Claude Code MCP server config carries the /mcp/* Bearer token in env, so
+# the live copy stays local. Use .mcp.json.example as a template.
+.mcp.json
+
+# host test outputs
+components/jtts/test/host/*.wav
+components/jtts/generated/
+components/jtts/test/host/build/
+
+# Rust BLE CLI build artifacts
+/tools/ble-cli/target/
+
+# ADR-001 release packaging output (script/pack_release.py, `make pack`)
+release/

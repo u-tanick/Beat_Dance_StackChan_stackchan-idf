@@ -1,0 +1,39 @@
+menu "jtts (Japanese TTS)"
+
+config JTTS_ENABLE_HMM
+    bool "Enable HMM (hts_engine) synthesis engine"
+    default n
+    help
+        HMM 音声合成 (hts_engine) を有効にする。.htsvoice ボイス (~1-2 MB) を
+        flash の voice パーティションに置ける 16 MB flash + PSRAM ボード
+        (CoreS3 / stopwatch) 向け。無効時は render_hmm がスタブになり
+        hts_engine のコードはリンクされない。
+
+config JTTS_ENABLE_SANOTTS
+    bool "Enable sanoTTS-jp neural synthesis engine"
+    default n
+    help
+        sanoTTS-jp (559 K パラメータのニューラル TTS、22.05 kHz) を有効にする。
+        重み blob (654 KB、公式 Releases から取得) を flash の sanotts 領域に置き、
+        合成の作業領域 176 KB を PSRAM に取る。PSRAM のあるボード向け。
+        無効時は render_sano がスタブになり、推論コアはリンクされない。
+
+config JTTS_SANO_ARENA_INTERNAL
+    bool "sanoTTS: place the 176 KB arena in internal DRAM when possible"
+    depends on JTTS_ENABLE_SANOTTS
+    default n
+    help
+        合成の作業領域を内部 DRAM のヒープから確保する (取れなければ PSRAM に
+        フォールバック)。ヒープの最大連続ブロックは通常 176 KB に届かないので、
+        確実に内部 RAM に置くには JTTS_SANO_ARENA_STATIC を使う。
+
+config JTTS_SANO_ARENA_STATIC
+    bool "sanoTTS: reserve the 176 KB arena as a static .bss array"
+    depends on JTTS_ENABLE_SANOTTS
+    default n
+    help
+        公式 sanoTTS-jp ファームウェアと同じく、作業領域をリンカが内部 DRAM に置く
+        静的配列にする。静的 DRAM を 176 KB 恒久的に消費するので、機能を絞った
+        プロファイル (cores3-fast) 向け。RTF は PSRAM 配置の約 1/1.4〜1/2。
+
+endmenu

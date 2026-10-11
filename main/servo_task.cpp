@@ -1,0 +1,242 @@
+// SPDX-FileCopyrightText: 2026 Kenta IDA <fuga@fugafuga.org>
+// SPDX-License-Identifier: BSL-1.0
+
+#include <config_service/task_stack.hpp>
+#include "servo_task.hpp"
+
+#include <driver/gpio.h>
+#include <driver/uart.h>
+#include <esp_log.h>
+#include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+
+#include "scs_servo/scs_bus.hpp"
+#include "scs_servo/scs_servo.hpp"
+
+namespace stackchan::app {
+
+namespace {
+
+constexpr const char* kTag = "servo";
+constexpr TickType_t kPeriodTicks = pdMS_TO_TICKS(20);
+
+// SCS0009 Goal Speed is roughly in 0.146°/s units; 200 ≈ 30°/s — pleasant
+// head-turning speed. Goal Time = 0 means "use Goal Speed".
+constexpr std::uint16_t kGoalSpeed = 200;
+constexpr std::uint16_t kGoalTime = 0;
+
+void servo_task_entry(void* arg)
+{
+    auto& args = *static_cast<ServoTaskArgs*>(arg);
+
+    auto bus_result = scs_servo::ScsBus::create(args.bus_cfg);
+    if (!bus_result) {
+        ESP_LOGE(kTag, "ScsBus::create failed: %d", static_cast<int>(bus_result.error()));
+        vTaskDeleteWithCaps(nullptr);
+        return;
+    }
+    auto bus = std::move(*bus_result);
+
+    scs_servo::ScsServo yaw{bus, scs_servo::kYawId};
+    scs_servo::ScsServo pitch{bus, scs_servo::kPitchId};
+
+    if (auto r = yaw.ping(); !r) {
+        ESP_LOGW(kTag, "yaw (id=%u) ping failed: %d", scs_servo::kYawId,
+                 static_cast<int>(r.error()));
+    } else {
+        ESP_LOGI(kTag, "yaw (id=%u) ping OK", scs_servo::kYawId);
+    }
+    if (auto r = pitch.ping(); !r) {
+        ESP_LOGW(kTag, "pitch (id=%u) ping failed: %d", scs_servo::kPitchId,
+                 static_cast<int>(r.error()));
+    } else {
+        ESP_LOGI(kTag, "pitch (id=%u) ping OK", scs_servo::kPitchId);
+    }
+    // Torque is engaged on demand: enabled just before a move, released once
+    // the move should have completed, so the servos are silent / cool / free
+    // while the head holds still. Moves are speed-based (kGoalTime = 0), so we
+    // estimate the duration from the angular distance and goal speed. The
+    // on-device 操作 toggle's servo_enabled = false forces torque off and
+    // suppresses moves entirely (脱力).
+    constexpr float kDegPerStep = 0.3125f;      // SCS0009: 1 step ≈ 0.3125°
+    constexpr float kDegPerSpeedUnit = 0.15f;   // goal-speed unit ≈ 0.15 °/s
+    constexpr std::uint32_t kSettleMarginMs = 150; // hold a bit past the estimate
+    constexpr std::uint32_t kMinHoldMs = 120;
+    constexpr std::uint32_t kUnknownMoveMs = 1500;  // start pose / re-drive (origin unknown)
+
+    auto move_ms = [](std::uint16_t from, std::uint16_t to, std::uint16_t speed) -> std::uint32_t {
+        const int delta = (from > to) ? (from - to) : (to - from);
+        const float dps = speed * kDegPerSpeedUnit;
+        if (dps <= 0.0f) return kMinHoldMs;
+        const std::uint32_t ms = static_cast<std::uint32_t>(delta * kDegPerStep / dps * 1000.0f);
+        return ms < kMinHoldMs ? kMinHoldMs : ms;
+    };
+    auto now_ms = [] { return static_cast<std::uint32_t>(esp_timer_get_time() / 1000); };
+
+    // Start with torque off; the first loop drives to the commanded pose.
+    std::uint16_t last_yaw_target = 0xFFFF;
+    std::uint16_t last_pitch_target = 0xFFFF;
+    bool torque_on = false;
+    bool last_enabled = true;
+    std::uint32_t release_at = 0; // when to drop torque after the current move
+
+    // Range-setting mode: torque off (so the user moves the head by hand) and
+    // poll present-position every ~150 ms so the settings UIs can show / capture
+    // it. Cheaper than the 20 ms control loop (each Read is a UART round-trip
+    // ~3 ms; doing it at 20 ms eats half the bus and dwarfs anything else).
+    bool last_range_mode = false;
+    constexpr TickType_t kRangePollTicks = pdMS_TO_TICKS(150);
+    TickType_t next_range_poll = 0;
+
+    TickType_t last_wake = xTaskGetTickCount();
+    for (;;) {
+        const bool range_mode = args.state->servo.range_mode.load(std::memory_order_relaxed);
+        if (range_mode) {
+            if (torque_on || !last_range_mode) {
+                (void)yaw.enable_torque(false);
+                (void)pitch.enable_torque(false);
+                torque_on = false;
+            }
+            last_range_mode = true;
+            last_enabled = false; // force re-drive on exit
+            const TickType_t now = xTaskGetTickCount();
+            // Signed cast so the subtraction handles TickType_t wraparound
+            // ("now has passed next_range_poll" without a raw unsigned compare).
+            if (static_cast<std::int32_t>(now - next_range_poll) >= 0) {
+                next_range_poll = now + kRangePollTicks;
+                if (auto r = yaw.read_present_position()) {
+                    args.state->servo.yaw_raw.store(static_cast<std::int16_t>(*r),
+                                                    std::memory_order_relaxed);
+                }
+                if (auto r = pitch.read_present_position()) {
+                    args.state->servo.pitch_raw.store(static_cast<std::int16_t>(*r),
+                                                      std::memory_order_relaxed);
+                }
+            }
+            vTaskDelayUntil(&last_wake, kPeriodTicks);
+            continue;
+        }
+        if (last_range_mode) {
+            // Exited range mode: drop stale present-position so a stale read
+            // doesn't confuse the UI (re-publish on the next entry).
+            args.state->servo.yaw_raw.store(-1, std::memory_order_relaxed);
+            args.state->servo.pitch_raw.store(-1, std::memory_order_relaxed);
+            last_yaw_target = last_pitch_target = 0xFFFF; // re-drive
+            last_range_mode = false;
+        }
+
+        const bool enabled = args.state->servo.enabled.load(std::memory_order_relaxed);
+        if (!enabled) {
+            if (torque_on) {
+                (void)yaw.enable_torque(false);
+                (void)pitch.enable_torque(false);
+                torque_on = false;
+            }
+            last_enabled = false;
+            vTaskDelayUntil(&last_wake, kPeriodTicks);
+            continue;
+        }
+        if (!last_enabled) {
+            // Re-enabled (復帰): re-drive to the commanded pose.
+            last_yaw_target = last_pitch_target = 0xFFFF;
+            last_enabled = true;
+        }
+
+        // Audio guard: the servos and the speaker amp/codec share a power rail,
+        // and the current draw of a move (or the transient of toggling torque)
+        // sags it enough to glitch / cut the audio. While speech output is in
+        // progress, hold the head perfectly still — no goal writes, no torque
+        // changes. The mask is set/cleared by the application at speech
+        // start/end (conversation reply, idle babble); BLE / Wi-Fi streaming
+        // uses audio_stream_active. We never poll the speaker directly: its
+        // isPlaying() flickers false between streamed reply segments and would
+        // let the head twitch mid-reply.
+        // ダンス中 (dance_active) は音声再生中でもサーボを動かす — 電源レール
+        // 競合による音声劣化の許容度を実機で確かめるための意図的なバイパス
+        // (docs/dance-feature-research.md §2)。
+        const bool dance = args.state->servo.dance_active.load(std::memory_order_relaxed);
+        const bool audio_active = !dance &&
+                                  (args.state->servo.masked.load(std::memory_order_relaxed) ||
+                                   args.state->audio_stream_active.load(std::memory_order_relaxed));
+        if (audio_active) {
+            vTaskDelayUntil(&last_wake, kPeriodTicks);
+            continue;
+        }
+
+        // Clamp commanded angles to the configured motion range so callers
+        // (demo, conversation, future UI) all stay within the per-device limits.
+        const float yaw_deg = clamp_deg(args.state->servo.target_yaw_deg.load(std::memory_order_relaxed),
+                                        args.limits.yaw_min_deg, args.limits.yaw_max_deg);
+        const float pitch_deg = clamp_deg(args.state->servo.target_pitch_deg.load(std::memory_order_relaxed),
+                                          args.limits.pitch_min_deg, args.limits.pitch_max_deg);
+        const std::uint16_t yaw_target = scs_servo::deg_to_raw(yaw_deg, args.limits.yaw_zero);
+        const std::uint16_t pitch_target = scs_servo::deg_to_raw(pitch_deg, args.limits.pitch_zero);
+
+        // Non-zero servo_speed_override lets the demo task drive snappy
+        // gestures (e.g. head shake on nadenade) without permanently raising
+        // the default head-turn speed.
+        const std::uint16_t override = args.state->servo.speed_override.load(std::memory_order_relaxed);
+        const std::uint16_t speed = override != 0 ? override : kGoalSpeed;
+        // move_time_ms != 0 → 時間ベース goal (両軸を move_time で到達)。SCS0009 は
+        // time>0 のとき speed を無視するので speed=0 を渡す。ダンスの「移動秒数」用。
+        const std::uint16_t move_time = args.state->servo.move_time_ms.load(std::memory_order_relaxed);
+        const std::uint16_t goal_time = move_time;                 // 0 = 速度ベース
+        const std::uint16_t goal_speed = move_time != 0 ? 0 : speed;
+
+        if (yaw_target != last_yaw_target || pitch_target != last_pitch_target) {
+            // Engage torque just before driving.
+            if (!torque_on) {
+                (void)yaw.enable_torque(true);
+                (void)pitch.enable_torque(true);
+                torque_on = true;
+            }
+            std::uint32_t mv = kMinHoldMs;
+            if (move_time != 0 && move_time > mv) mv = move_time;  // 時間ベースは既知
+            if (yaw_target != last_yaw_target) {
+                if (move_time == 0) {
+                    const std::uint32_t a = (last_yaw_target == 0xFFFF)
+                                                ? kUnknownMoveMs
+                                                : move_ms(last_yaw_target, yaw_target, speed);
+                    if (a > mv) mv = a;
+                }
+                (void)yaw.write_goal_position(yaw_target, goal_time, goal_speed);
+                last_yaw_target = yaw_target;
+            }
+            if (pitch_target != last_pitch_target) {
+                if (move_time == 0) {
+                    const std::uint32_t a = (last_pitch_target == 0xFFFF)
+                                                ? kUnknownMoveMs
+                                                : move_ms(last_pitch_target, pitch_target, speed);
+                    if (a > mv) mv = a;
+                }
+                (void)pitch.write_goal_position(pitch_target, goal_time, goal_speed);
+                last_pitch_target = pitch_target;
+            }
+            release_at = now_ms() + mv + kSettleMarginMs;
+        } else if (torque_on && now_ms() >= release_at) {
+            // Move complete and holding still → release torque.
+            (void)yaw.enable_torque(false);
+            (void)pitch.enable_torque(false);
+            torque_on = false;
+        }
+
+        vTaskDelayUntil(&last_wake, kPeriodTicks);
+    }
+}
+
+} // namespace
+
+void start_servo_task(ServoTaskArgs& args)
+{
+    // Stack in PSRAM: this task only drives UART1 (SCS bus) and reads shared
+    // state — it never calls flash / NVS / OTA APIs, which are the only
+    // things that require an internal-RAM stack. Frees 8 KiB of internal
+    // RAM (see docs: internal RAM budget on CoreS3 is the TLS bottleneck).
+    if (xTaskCreatePinnedToCoreWithCaps(servo_task_entry, "servo", 8192, &args, 4, nullptr, 0,
+                                        stackchan::kNoFlashTaskStackCaps) != pdPASS) {
+        ESP_LOGE(kTag, "xTaskCreate(servo) failed");
+    }
+}
+
+} // namespace stackchan::app
